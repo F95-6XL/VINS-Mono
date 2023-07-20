@@ -49,9 +49,13 @@ class FeatureTracker
     cv::Mat mask;
     cv::Mat fisheye_mask;
     cv::Mat prev_img, cur_img, forw_img;
-    vector<cv::Point2f> n_pts;
-    vector<cv::Point2f> prev_pts, cur_pts, forw_pts;
-    vector<cv::Point2f> prev_un_pts, cur_un_pts;
+    vector<cv::Point2f> n_pts; //保存所有新找到的需要补充到特征点集合中的角点
+    
+    vector<cv::Point2f> prev_pts;
+    vector<cv::Point2f> cur_pts; //保存当前图像中的特征点
+    vector<cv::Point2f> forw_pts; //保存新输入图像中能通过光流追踪到的特征点，劲作为临时变量，最后会赋值给cur_pts
+    vector<cv::Point2f> prev_un_pts;
+    vector<cv::Point2f> cur_un_pts; //保存当前帧去畸变后的点
     vector<cv::Point2f> pts_velocity;
     vector<int> ids;
     vector<int> track_cnt;

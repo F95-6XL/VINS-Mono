@@ -18,7 +18,7 @@ queue<sensor_msgs::ImageConstPtr> img_buf;
 ros::Publisher pub_img,pub_match;
 ros::Publisher pub_restart;
 
-FeatureTracker trackerData[NUM_OF_CAM];
+FeatureTracker trackerData[NUM_OF_CAM]; //存放当前时间下不同相机拍摄到的图像
 double first_image_time;
 int pub_count = 1;
 bool first_image_flag = true;
@@ -35,6 +35,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
         return;
     }
     // detect unstable camera stream
+    // 如果出现oosm，或者两帧之间的时间间隔超过1s，则重新初始化系统
     if (img_msg->header.stamp.toSec() - last_image_time > 1.0 || img_msg->header.stamp.toSec() < last_image_time)
     {
         ROS_WARN("image discontinue! reset the feature tracker!");
@@ -48,6 +49,8 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
     }
     last_image_time = img_msg->header.stamp.toSec();
     // frequency control
+    // 控制每秒发送频率，如果一下子来了很多图片，那么后面的就不处理了。
+    // FREQ是每秒发送的最大频率
     if (round(1.0 * pub_count / (img_msg->header.stamp.toSec() - first_image_time)) <= FREQ)
     {
         PUB_THIS_FRAME = true;
@@ -61,6 +64,8 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
     else
         PUB_THIS_FRAME = false;
 
+    // 将msg中的图像信息转换成opencv格式
+    //cv_bridge就是一座桥
     cv_bridge::CvImageConstPtr ptr;
     if (img_msg->encoding == "8UC1")
     {
@@ -126,7 +131,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
         vector<set<int>> hash_ids(NUM_OF_CAM);
         for (int i = 0; i < NUM_OF_CAM; i++)
         {
-            auto &un_pts = trackerData[i].cur_un_pts;
+            auto &un_pts = trackerData[i].cur_un_pts; //当前帧去畸变后的点
             auto &cur_pts = trackerData[i].cur_pts;
             auto &ids = trackerData[i].ids;
             auto &pts_velocity = trackerData[i].pts_velocity;
@@ -162,7 +167,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
             init_pub = 1;
         }
         else
-            pub_img.publish(feature_points);
+            pub_img.publish(feature_points); //发布input图像中特征点的信息
 
         if (SHOW_TRACK)
         {
