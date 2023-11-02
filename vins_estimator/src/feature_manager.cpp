@@ -49,21 +49,24 @@ bool FeatureManager::addFeatureCheckParallax(int frame_count, const map<int, vec
     double parallax_sum = 0;
     int parallax_num = 0;
     last_track_num = 0;
+    // 遍历当前帧中的所有特征点，检查有几个特征点是从上一帧追踪得到的，有几个是新建的
     for (auto &id_pts : image)
     {
         FeaturePerFrame f_per_fra(id_pts.second[0].second, td);
 
-        int feature_id = id_pts.first;
+        int feature_id = id_pts.first; // 当前特征点从系统启动开始的全局唯一id
         auto it = find_if(feature.begin(), feature.end(), [feature_id](const FeaturePerId &it)
                           {
             return it.feature_id == feature_id;
                           });
 
+        // feature中保存所有后端已知的特征点。如果在feature中没有找到，说明是新的特征点，push_back即可
         if (it == feature.end())
         {
             feature.push_back(FeaturePerId(feature_id, frame_count));
             feature.back().feature_per_frame.push_back(f_per_fra);
         }
+        // 如果在feature中找到了，说明是个通过光流追踪得到的老点，对追踪成功计算进行++
         else if (it->feature_id == feature_id)
         {
             it->feature_per_frame.push_back(f_per_fra);
@@ -71,19 +74,27 @@ bool FeatureManager::addFeatureCheckParallax(int frame_count, const map<int, vec
         }
     }
 
+    // 如果追踪得到的小于20个，说明可能到了一个比较陌生的场景，因此需要插入关键帧
     if (frame_count < 2 || last_track_num < 20)
         return true;
 
     for (auto &it_per_id : feature)
     {
+        //当FeaturePerId初始化时，start_frame=frame_count
+        //这里减2就说明要求特征点至少在2帧前已经被观察到。这里和后面计算视差要往前回溯两帧对应起来。
         if (it_per_id.start_frame <= frame_count - 2 &&
+            // it_per_id.feature_per_frame.size()代表特征点被多少关键帧所追踪，即代表被多少关键帧看到
+            // 所以这里等价于要求在点被观测到之后就一直能追踪成功
+            // （为什么会有大于的情况？）
             it_per_id.start_frame + int(it_per_id.feature_per_frame.size()) - 1 >= frame_count - 1)
         {
-            parallax_sum += compensatedParallax2(it_per_id, frame_count);
+            parallax_sum += compensatedParallax2(it_per_id, frame_count); //计算上一帧和上上帧之间的视差，进行统计
             parallax_num++;
         }
     }
 
+    // parallax代表了帧之间的平行度，如果帧之间都是往一个方向动的，那光流就能持续追踪成功
+    // 而当没有平行度的时候，就要插入新关键帧了，所以返回true
     if (parallax_num == 0)
     {
         return true;
@@ -92,7 +103,7 @@ bool FeatureManager::addFeatureCheckParallax(int frame_count, const map<int, vec
     {
         ROS_DEBUG("parallax_sum: %lf, parallax_num: %d", parallax_sum, parallax_num);
         ROS_DEBUG("current parallax: %lf", parallax_sum / parallax_num * FOCAL_LENGTH);
-        return parallax_sum / parallax_num >= MIN_PARALLAX;
+        return parallax_sum / parallax_num >= MIN_PARALLAX; //视差比较大的时候，也考虑插入关键帧
     }
 }
 
@@ -120,8 +131,12 @@ void FeatureManager::debugShow()
 vector<pair<Vector3d, Vector3d>> FeatureManager::getCorresponding(int frame_count_l, int frame_count_r)
 {
     vector<pair<Vector3d, Vector3d>> corres;
+
+    // 遍历所有特征点，寻找特征点中全程存在于两帧之间的点
+    // frame_count_l 提供了起始帧id，frame_count_r提供了结束帧id
     for (auto &it : feature)
     {
+        // 特征点的起始帧<=起始帧id，且结束帧>=结束帧id，说明在两帧之前全程光流跟踪成功
         if (it.start_frame <= frame_count_l && it.endFrame() >= frame_count_r)
         {
             Vector3d a = Vector3d::Zero(), b = Vector3d::Zero();

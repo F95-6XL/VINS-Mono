@@ -61,11 +61,20 @@ void predict(const sensor_msgs::ImuConstPtr &imu_msg)
     double rz = imu_msg->angular_velocity.z;
     Eigen::Vector3d angular_velocity{rx, ry, rz};
 
+    // tmp_Q保存的是车子的旋转，即Rwb
+    // acc_0保存的是上一时刻车体坐标系下的加速度
+    // tmp_Ba是IMU传感器模型中随时间缓慢变化的bias项
+    // 这里先将车体坐标系下加速度减ba后转换到世界坐标系，再减去重力加速度
+    // 得到的是上一时刻世界坐标系下的线加速度，un代表世界坐标
     Eigen::Vector3d un_acc_0 = tmp_Q * (acc_0 - tmp_Ba) - estimator.g;
 
+    // gyr_0保存上一时刻的角速度
+    // 这里在做的是对车子SO3坐标的更新，公式参考Robotik1式7.4，并在此基础上进行积分得到
+    // 角速度为什么没有做坐标转换？因为角速度是陀螺仪测量的，测量结果从始至终都是在初始坐标系下，即世界坐标系下
     Eigen::Vector3d un_gyr = 0.5 * (gyr_0 + angular_velocity) - tmp_Bg;
     tmp_Q = tmp_Q * Utility::deltaQ(un_gyr * dt);
 
+    // 当前时刻世界坐标下的线加速度
     Eigen::Vector3d un_acc_1 = tmp_Q * (linear_acceleration - tmp_Ba) - estimator.g;
 
     Eigen::Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
@@ -100,11 +109,16 @@ getMeasurements()
 {
     std::vector<std::pair<std::vector<sensor_msgs::ImuConstPtr>, sensor_msgs::PointCloudConstPtr>> measurements;
 
+    // IMU的数据频率比图像的要高很多，这里主要考虑IMU数据和图像数据的对齐问题
+    // 实际处理的时候，都是很多IMU数据和一帧图像为一组进行处理的
+    // 这里要求IMU测量的时间范围必须覆盖图像的拍摄时间，且在IMU时间刚超出图像时间的时候对两者进行打包返回
+    // 相当于是将上一帧到当前帧图像之间获取的IMU数据，和当前帧图像打包，返回给process()进行处理
     while (true)
     {
         if (imu_buf.empty() || feature_buf.empty())
             return measurements;
 
+        // 比较IMU最后数据和下一帧要处理的图像数据的时间戳。如果小于等于，说明IMU数据还够着图像拍摄的时间，要再等等。
         if (!(imu_buf.back()->header.stamp.toSec() > feature_buf.front()->header.stamp.toSec() + estimator.td))
         {
             //ROS_WARN("wait for imu, only should happen at the beginning");
@@ -112,6 +126,7 @@ getMeasurements()
             return measurements;
         }
 
+        // 反过来，如果IMU第一组数据的时间戳大于等于下一帧要处理的图像的时间戳，，说明IMU数据滞后了，只能把图像舍弃。
         if (!(imu_buf.front()->header.stamp.toSec() < feature_buf.front()->header.stamp.toSec() + estimator.td))
         {
             ROS_WARN("throw img, only should happen at the beginning");
@@ -153,7 +168,7 @@ void imu_callback(const sensor_msgs::ImuConstPtr &imu_msg)
 
     {
         std::lock_guard<std::mutex> lg(m_state);
-        predict(imu_msg);
+        predict(imu_msg); //预测imu，这里使用的是简单的中值积分，因为前端只需要提供一个初步的位姿结果作为后面优化的初始值
         std_msgs::Header header = imu_msg->header;
         header.frame_id = "world";
         if (estimator.solver_flag == Estimator::SolverFlag::NON_LINEAR)
@@ -221,14 +236,15 @@ void process()
         for (auto &measurement : measurements)
         {
             auto img_msg = measurement.second;
+            double img_t = img_msg->header.stamp.toSec() + estimator.td;
             double dx = 0, dy = 0, dz = 0, rx = 0, ry = 0, rz = 0;
+            // 使用IMU测量将系统状态预测到img时间戳
             for (auto &imu_msg : measurement.first)
             {
                 double t = imu_msg->header.stamp.toSec();
-                double img_t = img_msg->header.stamp.toSec() + estimator.td;
-                if (t <= img_t)
+                if (t <= img_t) //分两种情况。对于大多数IMU数据来说，时间戳都是小于图像时间戳的。这个时候就利用所有的IMU数据来积分
                 { 
-                    if (current_time < 0)
+                    if (current_time < 0) //初始化
                         current_time = t;
                     double dt = t - current_time;
                     ROS_ASSERT(dt >= 0);
@@ -239,12 +255,14 @@ void process()
                     rx = imu_msg->angular_velocity.x;
                     ry = imu_msg->angular_velocity.y;
                     rz = imu_msg->angular_velocity.z;
+                    // 这里主要还是中值积分，但是积出来的结果都是相对上一个Frame的位姿来说的
+                    // 此外，这里还更新了Jacobian
                     estimator.processIMU(dt, Vector3d(dx, dy, dz), Vector3d(rx, ry, rz));
-                    //printf("imu: dt:%f a: %f %f %f w: %f %f %f\n",dt, dx, dy, dz, rx, ry, rz);
 
                 }
-                else
-                {
+                else //第二种情况在每一帧图像中应该只会发生一次，在数据同步的函数中也是以IMU时间戳超过图像时间戳作为数据发布条件的
+                {    //对于这种情况，我们的目标是将系统状态拉平到图像的时间戳
+                     //这时候首先IMU的测量需要插值到图像时间戳下，其次积分到达的时间点也应该是图像时间戳
                     double dt_1 = img_t - current_time;
                     double dt_2 = t - img_t;
                     current_time = img_t;
@@ -294,23 +312,28 @@ void process()
 
             TicToc t_s;
             map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> image;
-            for (unsigned int i = 0; i < img_msg->points.size(); i++)
+
+            // 遍历当前输入帧中的所有特征点，并按照特征点的全局唯一id进行归类
+            // 这里特征点的全局唯一id用于标记光流追踪得到的信息
+            for (unsigned int i = 0; i < img_msg->points.size(); i++) 
             {
                 int v = img_msg->channels[0].values[i] + 0.5;
-                int feature_id = v / NUM_OF_CAM;
+                int feature_id = v / NUM_OF_CAM; // 每个特征点的唯一id
                 int camera_id = v % NUM_OF_CAM;
-                double x = img_msg->points[i].x;
+                double x = img_msg->points[i].x; // 去畸变后的特征点在单位平面上的坐标，即去畸变后的(x/z, y/z, 1)
                 double y = img_msg->points[i].y;
                 double z = img_msg->points[i].z;
-                double p_u = img_msg->channels[1].values[i];
+                double p_u = img_msg->channels[1].values[i]; // 特征点的原式像素坐标
                 double p_v = img_msg->channels[2].values[i];
-                double velocity_x = img_msg->channels[3].values[i];
+                double velocity_x = img_msg->channels[3].values[i]; // 像素级别的速度，由光流跟踪得到
                 double velocity_y = img_msg->channels[4].values[i];
                 ROS_ASSERT(z == 1);
                 Eigen::Matrix<double, 7, 1> xyz_uv_velocity;
                 xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y;
                 image[feature_id].emplace_back(camera_id,  xyz_uv_velocity);
             }
+
+            // 处理当前帧的特征点
             estimator.processImage(image, img_msg->header);
 
             double whole_t = t_s.toc();
@@ -350,13 +373,18 @@ int main(int argc, char **argv)
 #endif
     ROS_WARN("waiting for image and imu...");
 
-    registerPub(n);
+    registerPub(n); // 设置本节点需要发布的信息
 
+    // IMU测量数据。因为这里只是前端，回调函数只是用IMU进行简单的积分运算得到下一时刻位姿的prediction
     ros::Subscriber sub_imu = n.subscribe(IMU_TOPIC, 2000, imu_callback, ros::TransportHints().tcpNoDelay());
-    ros::Subscriber sub_image = n.subscribe("/feature_tracker/feature", 2000, feature_callback);
-    ros::Subscriber sub_restart = n.subscribe("/feature_tracker/restart", 2000, restart_callback);
-    ros::Subscriber sub_relo_points = n.subscribe("/pose_graph/match_points", 2000, relocalization_callback);
 
+    //feature tracker的输出，包含了从原始图像中提取的特征点。这里只是简单的把msg加入buffer
+    ros::Subscriber sub_image = n.subscribe("/feature_tracker/feature", 2000, feature_callback); 
+
+    ros::Subscriber sub_restart = n.subscribe("/feature_tracker/restart", 2000, restart_callback);
+    ros::Subscriber sub_relo_points = n.subscribe("/pose_graph/match_points", 2000, relocalization_callback); //pose graph节点发出的
+
+    //后端处理的主线程。
     std::thread measurement_process{process};
     ros::spin();
 

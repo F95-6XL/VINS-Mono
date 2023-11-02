@@ -87,10 +87,13 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
     for (int i = 0; i < NUM_OF_CAM; i++)
     {
         ROS_DEBUG("processing camera %d", i);
+        //单目情况，STEREO_TRACK=false
         if (i != 1 || !STEREO_TRACK)
+            //readImage函数进行了光流追踪，去畸变，特征点补齐等一系列操作
             trackerData[i].readImage(ptr->image.rowRange(ROW * i, ROW * (i + 1)), img_msg->header.stamp.toSec());
         else
         {
+            //配置文件中EQUALIZE值为1：if image is too dark or light, trun on equalize to find enough features
             if (EQUALIZE)
             {
                 cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE();
@@ -139,7 +142,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
             {
                 if (trackerData[i].track_cnt[j] > 1)
                 {
-                    int p_id = ids[j];
+                    int p_id = ids[j]; // ids中存储特征点的id，特征点的id全局唯一，从0开始递增，并在光流跟踪成功的点间进行propagate
                     hash_ids[i].insert(p_id);
                     geometry_msgs::Point32 p;
                     p.x = un_pts[j].x;
@@ -169,7 +172,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
         else
             pub_img.publish(feature_points); //发布input图像中特征点的信息
 
-        if (SHOW_TRACK)
+        if (SHOW_TRACK) //可视化
         {
             ptr = cv_bridge::cvtColor(ptr, sensor_msgs::image_encodings::BGR8);
             //cv::Mat stereo_img(ROW * NUM_OF_CAM, COL, CV_8UC3);
@@ -218,7 +221,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < NUM_OF_CAM; i++)
         trackerData[i].readIntrinsicParameter(CAM_NAMES[i]);
 
-    if(FISHEYE)
+    if(FISHEYE) //对于鱼眼相机，由于周围一圈的畸变太大，一般作抛弃处理。所以要用到mask。ORBSLAM中也有类似操作。
     {
         for (int i = 0; i < NUM_OF_CAM; i++)
         {
@@ -233,10 +236,14 @@ int main(int argc, char **argv)
         }
     }
 
-    ros::Subscriber sub_img = n.subscribe(IMAGE_TOPIC, 100, img_callback);
+    ros::Subscriber sub_img = n.subscribe(IMAGE_TOPIC, 100, img_callback); //接受图像并使用光流提取角点
 
-    pub_img = n.advertise<sensor_msgs::PointCloud>("feature", 1000);
-    pub_match = n.advertise<sensor_msgs::Image>("feature_img",1000);
+    //用于发布提取完角点的特征，形式是点向量。也就是说接下来的所有处理都是以这些点为基础了，而不是图像
+    //特征点中包含了原始像素坐标，去畸变后的像素坐标，以及点的像素级别速度
+    pub_img = n.advertise<sensor_msgs::PointCloud>("feature", 1000); 
+
+    //用于可视化
+    pub_match = n.advertise<sensor_msgs::Image>("feature_img",1000); 
     pub_restart = n.advertise<std_msgs::Bool>("restart",1000);
     /*
     if (SHOW_TRACK)

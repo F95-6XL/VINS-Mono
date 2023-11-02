@@ -96,8 +96,11 @@ void Estimator::processIMU(double dt, const Vector3d &linear_acceleration, const
     }
     if (frame_count != 0)
     {
+        // frame_count是对输入图像的计数。而一个图像输入对应多个IMU输入，因此这里是push_back
         pre_integrations[frame_count]->push_back(dt, linear_acceleration, angular_velocity);
         //if(solver_flag != NON_LINEAR)
+            // 每次来新的帧的时候就把旧的tmp_pre_integration赋值给该帧
+            // 再创建一个新的tmp_pre_integration开始积分，直到下一帧图像
             tmp_pre_integration->push_back(dt, linear_acceleration, angular_velocity);
 
         dt_buf[frame_count].push_back(dt);
@@ -121,10 +124,16 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
 {
     ROS_DEBUG("new image coming ------------------------------------------");
     ROS_DEBUG("Adding feature points %lu", image.size());
-    if (f_manager.addFeatureCheckParallax(frame_count, image, td))
-        marginalization_flag = MARGIN_OLD;
+    // 做视差检测，由此决定滑窗中需要保留的帧。
+    // 如果LK光流跟踪的比较丝滑的，就可以不用添加关键帧
+    // 这里对LK跟踪质量做两个方面校验：
+    // 1. 光流跟踪成功点数量>20
+    // 2. 光流跟踪点走过的像素距离<阈值。即平均视差<阈值。
+    // 以上条件任意一个没满足，就创建新关键帧。
+    if (f_manager.addFeatureCheckParallax(frame_count, image, td)) 
+        marginalization_flag = MARGIN_OLD; //当视差大时，删除最老的帧，相当于引入了一个新的关键帧
     else
-        marginalization_flag = MARGIN_SECOND_NEW;
+        marginalization_flag = MARGIN_SECOND_NEW; //当视差小时，使用当前帧替换之前刚插入的帧，相当于没有引入新关键帧
 
     ROS_DEBUG("this frame is--------------------%s", marginalization_flag ? "reject" : "accept");
     ROS_DEBUG("%s", marginalization_flag ? "Non-keyframe" : "Keyframe");
@@ -137,34 +146,46 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     all_image_frame.insert(make_pair(header.stamp.toSec(), imageframe));
     tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
 
+    // 对传感器进行标定。VINS中采用了自适应的标定方式
+    // 即每次初始化时都进行一次标定，但是一旦标定成功就一直用这个参数，不再标定了
     if(ESTIMATE_EXTRINSIC == 2)
     {
         ROS_INFO("calibrating extrinsic param, rotation movement is needed");
         if (frame_count != 0)
         {
+            // 找到参与标定的两帧中通过光流跟踪得到的特征点对
             vector<pair<Vector3d, Vector3d>> corres = f_manager.getCorresponding(frame_count - 1, frame_count);
             Matrix3d calib_ric;
+
+            // 使用IMU预计分得到的两帧间的旋转，进行标定
+            // pre_integrations[frame_count]->delta_q 即两帧间的四元素旋转
+            // calib_ric 为出参
+            // 这里主要用到了手眼标定
             if (initial_ex_rotation.CalibrationExRotation(corres, pre_integrations[frame_count]->delta_q, calib_ric))
             {
                 ROS_WARN("initial extrinsic rotation calib success");
                 ROS_WARN_STREAM("initial extrinsic rotation: " << endl << calib_ric);
                 ric[0] = calib_ric;
                 RIC[0] = calib_ric;
-                ESTIMATE_EXTRINSIC = 1;
+                ESTIMATE_EXTRINSIC = 1; // 如果标定成功，设置为1，下次就不用标定了
             }
         }
     }
 
-    if (solver_flag == INITIAL)
+    if (solver_flag == INITIAL) // 初始化
     {
-        if (frame_count == WINDOW_SIZE)
+        // VINS采用滑窗方法，所以要等图像数量足够之后再开始初始化
+        // 其中WINDOW_SIZE设置为10
+        if (frame_count == WINDOW_SIZE) 
         {
             bool result = false;
+            //初始化还有一个条件，就是外参标定成功
             if( ESTIMATE_EXTRINSIC != 2 && (header.stamp.toSec() - initial_timestamp) > 0.1)
             {
-               result = initialStructure();
+               result = initialStructure(); // 检查标定结果
                initial_timestamp = header.stamp.toSec();
             }
+
             if(result)
             {
                 solver_flag = NON_LINEAR;
@@ -218,17 +239,24 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
 bool Estimator::initialStructure()
 {
     TicToc t_sfm;
+    // 1. 检查加速度计测得的所有加速度标准差
+    //    all_image_frame 中保存了系统启动开始所有的图像
+    //    frame_it->second.pre_integration中保存了上帧到当前帧的IMU积分结果
     //check imu observibility
     {
         map<double, ImageFrame>::iterator frame_it;
         Vector3d sum_g;
         for (frame_it = all_image_frame.begin(), frame_it++; frame_it != all_image_frame.end(); frame_it++)
         {
+            // dt是两帧之间的时间差
+            // dv是两帧之间的速度差
+            // 相除得到加速度
             double dt = frame_it->second.pre_integration->sum_dt;
             Vector3d tmp_g = frame_it->second.pre_integration->delta_v / dt;
             sum_g += tmp_g;
         }
         Vector3d aver_g;
+        // 加速度均值
         aver_g = sum_g * 1.0 / ((int)all_image_frame.size() - 1);
         double var = 0;
         for (frame_it = all_image_frame.begin(), frame_it++; frame_it != all_image_frame.end(); frame_it++)
@@ -238,41 +266,64 @@ bool Estimator::initialStructure()
             var += (tmp_g - aver_g).transpose() * (tmp_g - aver_g);
             //cout << "frame g " << tmp_g.transpose() << endl;
         }
+        // 加速度标准差
         var = sqrt(var / ((int)all_image_frame.size() - 1));
-        //ROS_WARN("IMU variation %f!", var);
+
+        // 标准差必须大于0.25才行，目的是为了让IMU有个充分的运行
         if(var < 0.25)
         {
             ROS_INFO("IMU excitation not enouth!");
             //return false;
         }
     }
+
     // global sfm
     Quaterniond Q[frame_count + 1];
     Vector3d T[frame_count + 1];
     map<int, Vector3d> sfm_tracked_points;
-    vector<SFMFeature> sfm_f;
+    vector<SFMFeature> sfm_f; // 包含了所有特征点，以及特征点被观测到的帧id，以及在帧中的坐标
+
+    // 遍历从系统启动开始到现在的所有特征点
+    // f_manager即之前计算平行度时候用到的
+    // f_manager.feature中保存了全局的feature_id所对应的每个点
     for (auto &it_per_id : f_manager.feature)
     {
-        int imu_j = it_per_id.start_frame - 1;
+        int imu_j = it_per_id.start_frame - 1; // 当前特征点第一次被追踪到的frame。这里-1是对应到for循环里直接++
         SFMFeature tmp_feature;
         tmp_feature.state = false;
         tmp_feature.id = it_per_id.feature_id;
+
+        // 遍历每一个能观察到该特征点的frame
+        // 在f_manager.addFeatureCheckParallax中对于当前帧中的特征点有个归类动作
+        // 如果特征点是从旧点通过光流得到的，就会把它push_back到旧点的feature_per_frame中
+        // 因此it_per_id.feature_per_frame中保存了当前it_per_id代表的特征点所对应的所有frame
         for (auto &it_per_frame : it_per_id.feature_per_frame)
         {
-            imu_j++;
-            Vector3d pts_j = it_per_frame.point;
+            imu_j++; // 特征点对应的frame count。由于特征点由光流追踪，保证了它在帧间的连续性
+            Vector3d pts_j = it_per_frame.point; // 特征点在每一帧中的坐标
+            //每个特征点能够被哪些帧观测到以及特征点在这些帧中的坐标
             tmp_feature.observation.push_back(make_pair(imu_j, Eigen::Vector2d{pts_j.x(), pts_j.y()}));
         }
-        sfm_f.push_back(tmp_feature);
+        sfm_f.push_back(tmp_feature); // 对一个特征点的预处理完成，push_back
     } 
+
     Matrix3d relative_R;
     Vector3d relative_T;
     int l;
+
+    // 2. 检查滑窗中保存的帧是否有和当前帧匹配的比较好的帧
+
+    // 在滑窗中寻找与当前帧匹配比较好的帧
+    // 条件为：1. 两帧间通过光流跟踪相关联的特征点对数量>20 2.这些点对构成的平行度好
+    // 如果找到则返回true，并返回帧id，以及两帧之间的相对位姿
     if (!relativePose(relative_R, relative_T, l))
     {
         ROS_INFO("Not enough features or parallax; Move device around");
         return false;
     }
+
+
+    // 3. 全局sfm
     GlobalSFM sfm;
     if(!sfm.construct(frame_count + 1, Q, T, l,
               relative_R, relative_T,
@@ -441,10 +492,18 @@ bool Estimator::visualInitialAlign()
 
 bool Estimator::relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l)
 {
-    // find previous frame which contians enough correspondance and parallex with newest frame
+    // 遍历滑窗中的每一帧，寻找和当前帧的最佳匹配
+    // 最佳匹配的条件为两帧间通过光流跟踪相关联的特征点对数量>20，以及点的平行度
+    // window size指滑窗大小，设置为10
+    // 注意，这里的寻找过程在滑窗中从前往后进行，也就是说找到符合的帧就return了
+    // 这样可以优先选择离当前帧比较远的帧
+
+    // find previous frame which contians enough correspondance and parallex with newest 
     for (int i = 0; i < WINDOW_SIZE; i++)
     {
         vector<pair<Vector3d, Vector3d>> corres;
+
+        // 寻找在两帧之前全程光流跟踪成功的点对数量
         corres = f_manager.getCorresponding(i, WINDOW_SIZE);
         if (corres.size() > 20)
         {
@@ -461,7 +520,7 @@ bool Estimator::relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l)
             average_parallax = 1.0 * sum_parallax / int(corres.size());
             if(average_parallax * 460 > 30 && m_estimator.solveRelativeRT(corres, relative_R, relative_T))
             {
-                l = i;
+                l = i; // l为匹配成功的帧的id
                 ROS_DEBUG("average_parallax %f choose l %d and newest frame to triangulate the whole structure", average_parallax * 460, l);
                 return true;
             }

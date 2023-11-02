@@ -15,6 +15,11 @@ class Utility
     template <typename Derived>
     static Eigen::Quaternion<typename Derived::Scalar> deltaQ(const Eigen::MatrixBase<Derived> &theta)
     {
+        // q_t+1 = q_t + d_(q_t)_t * dt
+        // 根据四元素的导数性质可知，q_t对时间的导数等于q_t叉乘1/2*omiga，即
+        // q_t+1 = q_t + d_(q_t)_t * dt = q_t + q_t * 1/2 * omiga * dt = q_t * (1 + q_t * 1/2 * omiga * dt)
+        // 所以整理一下，就变成了下面的式子
+        // 所以整个式子相当于是取t时刻和t+1时刻的角速度的均值作为时间积分的中值，将角度从t时刻积分到了t+1时刻
         typedef typename Derived::Scalar Scalar_t;
 
         Eigen::Quaternion<Scalar_t> dq;

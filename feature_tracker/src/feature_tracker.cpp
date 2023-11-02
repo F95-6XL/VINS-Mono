@@ -108,7 +108,7 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
     //保存新输入图像中能通过光流追踪到的特征点
     forw_pts.clear();
 
-    //保存当前图像中的特征点
+    //保存当前图像中的特征点。cur_pts实际上是上一帧中的角点。在初始化的时候，cur_pts.size()==0
     if (cur_pts.size() > 0)
     {
         TicToc t_o;
@@ -119,6 +119,7 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
         // 光流不需要计算描述子，而是先计算两帧间的速度，然后将上一帧需要追踪的点投影到下一帧，
         // 然后在cv::size定义的窗口中寻找最近的特征点作为匹配。
         // status是出参，只有追踪成功的status才是1
+        //注意光流是在未去畸变的原始图像上做的，因为无法直接对图像去畸变，而只能对像素点去畸变
         cv::calcOpticalFlowPyrLK(cur_img, forw_img, cur_pts, forw_pts, status, err, cv::Size(21, 21), 3);
 
         for (int i = 0; i < int(forw_pts.size()); i++)
@@ -134,12 +135,12 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
         ROS_DEBUG("temporal optical flow costs: %fms", t_o.toc());
     }
 
-    for (auto &n : track_cnt)
+    for (auto &n : track_cnt) //track_cnt用于对追踪成功的点进行计数
         n++;
 
     if (PUB_THIS_FRAME)
     {
-        rejectWithF(); //使用F矩阵过滤掉outlier
+        rejectWithF(); //使用F矩阵过滤掉outlier，基本思路就是先对匹配点对去畸变后求解F矩阵，然后剔除外点
         ROS_DEBUG("set mask begins");
         TicToc t_m;
         setMask(); //使用鱼眼的mask去除畸变太厉害的点，同时把角点按照track_cnt中的追踪成功计数值进行排序
@@ -190,7 +191,7 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
     prev_un_pts = cur_un_pts;
     cur_img = forw_img;
     cur_pts = forw_pts;
-    undistortedPoints();
+    undistortedPoints(); //去畸变，同时计算点的速度
     prev_time = cur_time;
 }
 
@@ -203,7 +204,7 @@ void FeatureTracker::rejectWithF()
         vector<cv::Point2f> un_cur_pts(cur_pts.size()), un_forw_pts(forw_pts.size());
         for (unsigned int i = 0; i < cur_pts.size(); i++)
         {
-            //将特征点坐标转换为归一化像素坐标
+            //将特征点坐标去畸变，并转换为归一化像素坐标
             //先转换为归一化球m面上的3维坐标，再把三维坐标除以z变成归一化平面上的坐标，再变成像素坐标
             Eigen::Vector3d tmp_p;
             m_camera->liftProjective(Eigen::Vector2d(cur_pts[i].x, cur_pts[i].y), tmp_p); //归一化球面坐标
@@ -232,12 +233,13 @@ void FeatureTracker::rejectWithF()
     }
 }
 
+// 唯一更新点id的地方。其他地方都只是使用
 bool FeatureTracker::updateID(unsigned int i)
 {
     if (i < ids.size())
     {
         if (ids[i] == -1)
-            ids[i] = n_id++;
+            ids[i] = n_id++; // 对于新创建的特征点，赋予全局唯一id。n_id是static变量，从0开始计数
         return true;
     }
     else
@@ -307,7 +309,7 @@ void FeatureTracker::undistortedPoints()
         pts_velocity.clear();
         for (unsigned int i = 0; i < cur_un_pts.size(); i++)
         {
-            if (ids[i] != -1)
+            if (ids[i] != -1) //如果是通过角点提取新加入的点，id为-1，设置初始速度为0
             {
                 std::map<int, cv::Point2f>::iterator it;
                 it = prev_un_pts_map.find(ids[i]);

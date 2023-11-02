@@ -59,12 +59,26 @@ class IntegrationBase
                             Eigen::Vector3d &result_delta_p, Eigen::Quaterniond &result_delta_q, Eigen::Vector3d &result_delta_v,
                             Eigen::Vector3d &result_linearized_ba, Eigen::Vector3d &result_linearized_bg, bool update_jacobian)
     {
-        //ROS_INFO("midpoint integration");
+        // 注意，这里的un坐标系为上一帧图像输入时的小车坐标。求解的也是相较于上一图像输入时刻的小车位姿信息
+        // 因此delta_q初始化为identity
+
+        // acc_0表示上一时刻线性加速度
+        // linearized_ba是bias项
+        // delta_q用于表示当前时刻与上一个图像输入时刻位姿的相对关系
+        // 和之前imu_callback中不同的是，这里乘的是delta_q，也就是说这里的计算是在上一幅image输入时小车位姿坐标系下进行的，所以这里也没有减去g
         Vector3d un_acc_0 = delta_q * (_acc_0 - linearized_ba);
+        
+        // q_t+1 = q_t + d_(q_t)_t * dt
+        // 根据四元素的导数性质可知，q_t对时间的导数等于q_t叉乘1/2*omiga，即
+        // q_t+1 = q_t + d_(q_t)_t * dt = q_t + q_t * 1/2 * omiga * dt = q_t * (1 + q_t * 1/2 * omiga * dt)
+        // 所以整理一下，就变成了下面的式子
+        // 所以整个式子相当于是取t时刻和t+1时刻的角速度的均值作为时间积分的中值，将角度从t时刻积分到了t+1时刻
+        // 参考https://blog.csdn.net/weixin_51547017/article/details/122136427
         Vector3d un_gyr = 0.5 * (_gyr_0 + _gyr_1) - linearized_bg;
         result_delta_q = delta_q * Quaterniond(1, un_gyr(0) * _dt / 2, un_gyr(1) * _dt / 2, un_gyr(2) * _dt / 2);
-        Vector3d un_acc_1 = result_delta_q * (_acc_1 - linearized_ba);
-        Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
+
+        Vector3d un_acc_1 = result_delta_q * (_acc_1 - linearized_ba); //拿到t+1时刻的角度，就可以求t+1时刻的全局加速度了
+        Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1); // 全局加速度的均值，再作为位姿和速度的积分中值
         result_delta_p = delta_p + delta_v * _dt + 0.5 * un_acc * _dt * _dt;
         result_delta_v = delta_v + un_acc * _dt;
         result_linearized_ba = linearized_ba;
