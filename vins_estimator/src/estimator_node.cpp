@@ -152,6 +152,8 @@ getMeasurements()
 
 void imu_callback(const sensor_msgs::ImuConstPtr &imu_msg)
 {
+    // 使用简单的中值积分更新位姿，并向外发布，保持位姿的一个高刷新率
+    // 同时保存数据，用于后端优化
     if (imu_msg->header.stamp.toSec() <= last_imu_t)
     {
         ROS_WARN("imu message in disorder!");
@@ -168,7 +170,7 @@ void imu_callback(const sensor_msgs::ImuConstPtr &imu_msg)
 
     {
         std::lock_guard<std::mutex> lg(m_state);
-        predict(imu_msg); //预测imu，这里使用的是简单的中值积分，因为前端只需要提供一个初步的位姿结果作为后面优化的初始值
+        predict(imu_msg); //预测imu，这里使用的是简单的中值积分，因为前端需要保持实时性。只需要提供一个初步的位姿结果。
         std_msgs::Header header = imu_msg->header;
         header.frame_id = "world";
         if (estimator.solver_flag == Estimator::SolverFlag::NON_LINEAR)

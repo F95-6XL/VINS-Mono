@@ -21,6 +21,7 @@ void Estimator::setParameter()
 
 void Estimator::clearState()
 {
+    // clearState函数在构造函数中被调用，被用于所有值的初始化
     for (int i = 0; i < WINDOW_SIZE + 1; i++)
     {
         Rs[i].setIdentity();
@@ -83,24 +84,40 @@ void Estimator::clearState()
 
 void Estimator::processIMU(double dt, const Vector3d &linear_acceleration, const Vector3d &angular_velocity)
 {
-    if (!first_imu)
+    // processIMU主要做两件事：
+    // 1. 进行预积分。
+    // 2. 使用中值积分将系统状态量预测到图像输入的时刻。这里得到的状态将作为BA的初始状态。
+
+    // 系统初始化，全局只执行一次
+    if (!first_imu) 
     {
         first_imu = true;
         acc_0 = linear_acceleration;
         gyr_0 = angular_velocity;
     }
 
-    if (!pre_integrations[frame_count])
+    // 图像帧预积分的初始化，每输入一帧新图像就执行一次
+    // Vins采用滑窗确定待优化帧，每输入一帧图像后会进行边缘化删除某一旧帧
+    // SW被边缘化后，最后一个坑就空出来了，变成null
+    // 而当进入下一帧图像，第一次输入IMU时，就会建立新的预积分对象
+    if (!pre_integrations[frame_count]) 
     {
         pre_integrations[frame_count] = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
     }
     if (frame_count != 0)
     {
-        // frame_count是对输入图像的计数。而一个图像输入对应多个IMU输入，因此这里是push_back
+        // frame_count是对SW中图像的计数，在稳定后就等于SW的size，即10。
+        // 由于新进来的图片可能被加入SW，也有可能被丢弃，所以这里需要两个integration
+        // pre_integrations中保存从上一个关键帧到当前帧的积分结果
+        // 而tmp_pre_integration中保存的是上一帧到当前帧的积分结果
+        // 由于一个图像输入对应多个IMU输入，因此这里是push_back
         pre_integrations[frame_count]->push_back(dt, linear_acceleration, angular_velocity);
         //if(solver_flag != NON_LINEAR)
-            // 每次来新的帧的时候就把旧的tmp_pre_integration赋值给该帧
+
+            // 对所有相邻帧进行的预积分，不管帧是不是在SW里面
+            // 每次新的帧处理完的时候的时候会把旧的tmp_pre_integration赋值给该帧
             // 再创建一个新的tmp_pre_integration开始积分，直到下一帧图像
+            // 因此tmp_pre_integration中保存了上一帧到当前帧的IMU中值积分结果
             tmp_pre_integration->push_back(dt, linear_acceleration, angular_velocity);
 
         dt_buf[frame_count].push_back(dt);
@@ -124,8 +141,13 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
 {
     ROS_DEBUG("new image coming ------------------------------------------");
     ROS_DEBUG("Adding feature points %lu", image.size());
+
     // 做视差检测，由此决定滑窗中需要保留的帧。
-    // 如果LK光流跟踪的比较丝滑的，就可以不用添加关键帧
+    // 确定SW边缘化需要删除的帧是当前头上的还是屁股上的。
+    // 同时将新输入的帧加入SW。新帧总是加入SW，这样SW才能总是保持最新的状态。
+    // 因此删除屁股上的帧，相当于删除上一帧图像输入，或者说，没有插入新的关键帧。
+    // 而删除掉头上的帧，上一帧图像输入就被保留了，或者说，插入了新关键帧。
+
     // 这里对LK跟踪质量做两个方面校验：
     // 1. 光流跟踪成功点数量>20
     // 2. 光流跟踪点走过的像素距离<阈值。即平均视差<阈值。
@@ -142,9 +164,9 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     Headers[frame_count] = header;
 
     ImageFrame imageframe(image, header.stamp.toSec());
-    imageframe.pre_integration = tmp_pre_integration;
+    imageframe.pre_integration = tmp_pre_integration; // 保存了上一帧到当前帧的IMU中值积分结果
     all_image_frame.insert(make_pair(header.stamp.toSec(), imageframe));
-    tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
+    tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]}; // 开始新的一帧积分
 
     // 对传感器进行标定。VINS中采用了自适应的标定方式
     // 即每次初始化时都进行一次标定，但是一旦标定成功就一直用这个参数，不再标定了
@@ -182,7 +204,11 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             //初始化还有一个条件，就是外参标定成功
             if( ESTIMATE_EXTRINSIC != 2 && (header.stamp.toSec() - initial_timestamp) > 0.1)
             {
-               result = initialStructure(); // 检查标定结果
+               // 检查标定结果，并尝试进行初始化
+               // 1. 检查加速度计测得的所有加速度标准差是否足够大，确保IMU得到了充分的运动
+               // 2. 检查是否有足够的帧间光流追踪点（>20）
+               // 3. 进行sfm，初始化地图
+               result = initialStructure(); 
                initial_timestamp = header.stamp.toSec();
             }
 
@@ -290,7 +316,7 @@ bool Estimator::initialStructure()
     {
         int imu_j = it_per_id.start_frame - 1; // 当前特征点第一次被追踪到的frame。这里-1是对应到for循环里直接++
         SFMFeature tmp_feature;
-        tmp_feature.state = false;
+        tmp_feature.state = false; // state代表点是否已经三角化成功
         tmp_feature.id = it_per_id.feature_id;
 
         // 遍历每一个能观察到该特征点的frame
@@ -311,11 +337,12 @@ bool Estimator::initialStructure()
     Vector3d relative_T;
     int l;
 
-    // 2. 检查滑窗中保存的帧是否有和当前帧匹配的比较好的帧
+    // 2. 检查滑窗中保存的帧是否有和当前帧匹配的比较好的帧，以用于初始化
 
     // 在滑窗中寻找与当前帧匹配比较好的帧
     // 条件为：1. 两帧间通过光流跟踪相关联的特征点对数量>20 2.这些点对构成的平行度好
     // 如果找到则返回true，并返回帧id，以及两帧之间的相对位姿
+    // 注意，这里求位姿用的是纯视觉的方法，没有IMU参与
     if (!relativePose(relative_R, relative_T, l))
     {
         ROS_INFO("Not enough features or parallax; Move device around");
@@ -323,7 +350,18 @@ bool Estimator::initialStructure()
     }
 
 
-    // 3. 全局sfm
+    // 3. 全局sfm, 初始化地图
+    // frame_count = 10
+    // 先使用上面找出来的两帧进行三角化，得到第一批世界坐标点，
+    // 然后再逐步使用PnP和三角化迭代，用SW中的所有帧来创建更多点
+    // 因为采用了光流，可以确保第一批初始化的世界坐标点都可以用于PnP
+    // 在遍历了SW中所有帧后，有了所有帧的位姿，以及对应的世界坐标点
+    // 最后再进行一次全局BA，就算初始化完成了
+    // 注意！这里得到的世界坐标点保存在sfm_tracked_points中，
+    // 他们并不会被作为地图点！
+    // 因为sfm里面的三角化只用到了两帧，即使有的点被多帧观测到！
+    // 所以真正的地图点三角化在下面的visualInitialAlign中进行
+    // 那里将使用所有能观测到地图点的帧来进行三角化，因此更加鲁棒！
     GlobalSFM sfm;
     if(!sfm.construct(frame_count + 1, Q, T, l,
               relative_R, relative_T,
@@ -335,6 +373,9 @@ bool Estimator::initialStructure()
     }
 
     //solve pnp for all frame
+    // 初始化完成后，再继续利用其余的所有历史图像帧进行PnP
+    // 但是这里仅仅是为了给其他帧一个位姿，以确保位姿的连续性
+    // 并不会用这些帧来三角化
     map<double, ImageFrame>::iterator frame_it;
     map<int, Vector3d>::iterator it;
     frame_it = all_image_frame.begin( );
@@ -402,6 +443,12 @@ bool Estimator::initialStructure()
         frame_it->second.R = R_pnp * RIC[0].transpose();
         frame_it->second.T = T_pnp;
     }
+
+    // 现在我们有了两个渠道的位姿，
+    // 一个是通过processIMU由IMU观测得到的帧间的相对位姿
+    // 另一个是通过视觉的PnP推断出来的绝对位姿
+    // 所以下面需要通过不相干的两个渠道得到的结果进行一次校准
+    // 并由此得到最终的世界坐标系以及所有帧的位姿
     if (visualInitialAlign())
         return true;
     else
@@ -417,6 +464,10 @@ bool Estimator::visualInitialAlign()
     TicToc t_g;
     VectorXd x;
     //solve scale
+    // 到目前通过视觉得到的位姿是没有scale的
+    // 但是旋转是可以用的
+    // 因此用旋转来修正陀螺仪的bg，
+    // 再反过来通过IMU获得scale，同时计算重力g
     bool result = VisualIMUAlignment(all_image_frame, Bgs, g, x);
     if(!result)
     {
@@ -425,13 +476,16 @@ bool Estimator::visualInitialAlign()
     }
 
     // change state
+    // 到这里，所有待定参数都已经估计完成
+    // 视觉和IMU的观测结果也已经耦合
+    // 接下来要做的就是定义新的世界坐标系，并修正所有帧的位姿
     for (int i = 0; i <= frame_count; i++)
     {
         Matrix3d Ri = all_image_frame[Headers[i].stamp.toSec()].R;
         Vector3d Pi = all_image_frame[Headers[i].stamp.toSec()].T;
-        Ps[i] = Pi;
+        Ps[i] = Pi; // Ps，Rs中保存各个帧的相机位姿
         Rs[i] = Ri;
-        all_image_frame[Headers[i].stamp.toSec()].is_key_frame = true;
+        all_image_frame[Headers[i].stamp.toSec()].is_key_frame = true; // SW中的帧都是关键帧
     }
 
     VectorXd dep = f_manager.getDepthVector();
@@ -440,20 +494,29 @@ bool Estimator::visualInitialAlign()
     f_manager.clearDepth(dep);
 
     //triangulat on cam pose , no tic
+    // 三角化，获得深度
+    // TIC,RIC是IMU和Camera坐标间的转换参数，
+    // 这里的TIC是0，也就是在相机坐标系下进行三角化
+    // 注意这里还没有引入s，所以下面还要再把深度乘上s
     Vector3d TIC_TMP[NUM_OF_CAM];
     for(int i = 0; i < NUM_OF_CAM; i++)
         TIC_TMP[i].setZero();
     ric[0] = RIC[0];
     f_manager.setRic(ric);
-    f_manager.triangulate(Ps, &(TIC_TMP[0]), &(RIC[0]));
+    f_manager.triangulate(Ps, &(TIC_TMP[0]), &(RIC[0])); 
 
-    double s = (x.tail<1>())(0);
+    // 之前repropagate的是每帧之间的预积分
+    // 这里有了更新后的Bgs，所有SW帧间的预积分也要重新来过
     for (int i = 0; i <= WINDOW_SIZE; i++)
     {
         pre_integrations[i]->repropagate(Vector3d::Zero(), Bgs[i]);
     }
+
+    // 把SW中的第一帧作为坐标原点，并使用scale修正每一帧的位姿
+    double s = (x.tail<1>())(0);
     for (int i = frame_count; i >= 0; i--)
         Ps[i] = s * Ps[i] - Rs[i] * TIC[0] - (s * Ps[0] - Rs[0] * TIC[0]);
+
     int kv = -1;
     map<double, ImageFrame>::iterator frame_i;
     for (frame_i = all_image_frame.begin(); frame_i != all_image_frame.end(); frame_i++)
@@ -461,7 +524,7 @@ bool Estimator::visualInitialAlign()
         if(frame_i->second.is_key_frame)
         {
             kv++;
-            Vs[kv] = frame_i->second.R * x.segment<3>(kv * 3);
+            Vs[kv] = frame_i->second.R * x.segment<3>(kv * 3); // x中还有每帧的速度，提取出来
         }
     }
     for (auto &it_per_id : f_manager.feature)
@@ -469,9 +532,11 @@ bool Estimator::visualInitialAlign()
         it_per_id.used_num = it_per_id.feature_per_frame.size();
         if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
             continue;
-        it_per_id.estimated_depth *= s;
+        it_per_id.estimated_depth *= s; // 前面三角化的时候没有考虑s，这里补上
     }
 
+    // 上面用s对P修正过了，接下来还要用旋转修正P,R,V
+    // 统一的世界坐标系原点为SW中的第一帧的相机位姿
     Matrix3d R0 = Utility::g2R(g);
     double yaw = Utility::R2ypr(R0 * Rs[0]).x();
     R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0;
@@ -518,6 +583,8 @@ bool Estimator::relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l)
 
             }
             average_parallax = 1.0 * sum_parallax / int(corres.size());
+
+            // 利用匹配点对，求F矩阵，并由此求出Rt
             if(average_parallax * 460 > 30 && m_estimator.solveRelativeRT(corres, relative_R, relative_T))
             {
                 l = i; // l为匹配成功的帧的id
@@ -728,10 +795,16 @@ bool Estimator::failureDetection()
 
 void Estimator::optimization()
 {
+    // 此函数为全文紧耦合优化的核心函数
+    // 分为三部分，即边缘化带来的约束，IMU约束和视觉约束
+    // 理论可参考https://blog.csdn.net/moyu123456789/article/details/103582051
+
     ceres::Problem problem;
     ceres::LossFunction *loss_function;
     //loss_function = new ceres::HuberLoss(1.0);
     loss_function = new ceres::CauchyLoss(1.0);
+
+    // 添加参数块
     for (int i = 0; i < WINDOW_SIZE + 1; i++)
     {
         ceres::LocalParameterization *local_parameterization = new PoseLocalParameterization();
@@ -759,6 +832,13 @@ void Estimator::optimization()
     TicToc t_whole, t_prepare;
     vector2double();
 
+    // 1. 边缘化marg约束
+    //    在我们边缘化删除一些关键帧和特征点时，最朴素的做法就是把他们直接删除，就好像不曾存在过。
+    //    但这样必然会造成information loss，不是我们希望的，
+    //    所以更好的做法是把删除的优化变量所带来的约束进行保留。
+    //    这里last_marginalization_info用于保存所有上一次被删除的优化变量给系统带来的全部约束，
+    //    因此它初始化为null，且将在在每次marg完成后被重新计算
+    //    这样，边缘化就不会带来information loss了
     if (last_marginalization_info)
     {
         // construct new marginlization_factor
@@ -767,6 +847,11 @@ void Estimator::optimization()
                                  last_marginalization_parameter_blocks);
     }
 
+    // 2. IMU预积分残差约束
+    //    每个SW中的帧的位姿都是一个节点，IMU预积分建立了相邻两个节点间的边。
+    //    根据相邻两帧对应节点的位姿我们可以从理论上计算出IMU预积分的期望值，
+    //    又根据实际IMU测量，我们可以得到IMU预积分实际值。
+    //    这里尝试优化这两个位姿节点，使这两项的差值逼近0。
     for (int i = 0; i < WINDOW_SIZE; i++)
     {
         int j = i + 1;
@@ -775,6 +860,21 @@ void Estimator::optimization()
         IMUFactor* imu_factor = new IMUFactor(pre_integrations[j]);
         problem.AddResidualBlock(imu_factor, NULL, para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]);
     }
+
+    // 3. 视觉残差约束
+    //    最小化重投影误差。
+    //    注意这里的约束添加方式为：
+    //    遍历每个特征点，找到对应的深度信息保存帧（即第一次看到该点的帧），
+    //    再遍历所有其他看到点的帧，在深度信息保存帧和各个共视帧之间建立约束。
+    //    也就是说这里的约束是以深度信息保存帧为中心，向后面的帧发散的。
+    //    这样做的好处就是，视觉残差的约束项不会被重复添加。
+    //    比如某个点在0-9帧都被观测到了，那么当前建立的重投影误差约束来自帧对0-1,0-2,0-3...0-9
+    //    而当0帧被边缘化时，这些约束将被转移到last_marginalization_info中得以保留
+    //    同时，特征点的深度信息保存帧顺移为1，
+    //    那么在下一次BA时，本部分建立的重投影误差约束就会来自帧对1-2,1-3,1-4...1-9
+    //    就避免了重复添加，又同时保证了所有帧对的组合最终都能被用上
+
+    //    因此，一旦某个点对应的深度信息保存帧被边缘化时，所有该点当前对应的约束也要一起被边缘化
     int f_m_cnt = 0;
     int feature_index = -1;
     for (auto &it_per_id : f_manager.feature)
@@ -882,11 +982,23 @@ void Estimator::optimization()
     double2vector();
 
     TicToc t_whole_marginalization;
+
+    // 删除最老帧
+    // 这里最主要的工作就是找到图优化中最老帧的删除所影响的所有边
+    // 并对每条边构建线性化的残差方程J^T*J * dx = J^T*e，其中e为残差，J为雅可比
+    // 然后使用schur消元把上述方程带来的约束进行降维（schur消元参见高翔十四讲第十章），
+    // 并将降维后的方程保存在marginalization_info中，以在下一次BA中作为边缘化带来的约束项
+    // 这样就可以把最老帧删除的同时，保留了它所带来的约束
+
+    // 注意，这里只能添加最老帧所影响的边。因为最终这些约束会被保留并参与BA。
+    // 如果不被最老帧影响的边也被加了进来，那在下次BA时，这些边也依然存在，就重复优化了
+    // 相当于同一条边被添加了两次。
     if (marginalization_flag == MARGIN_OLD)
     {
         MarginalizationInfo *marginalization_info = new MarginalizationInfo();
         vector2double();
 
+        // 在
         if (last_marginalization_info)
         {
             vector<int> drop_set;
@@ -905,10 +1017,14 @@ void Estimator::optimization()
             marginalization_info->addResidualBlockInfo(residual_block_info);
         }
 
+        // 最老帧对应的IMU约束边
+        // 这里的代码和上面BA类似，也是利用所连接的节点构建边对应的残差项
+        // 但是注意和上面BA和最老帧通过IMU测量边相连接的只有次老帧，因此这里只有一项
         {
             if (pre_integrations[1]->sum_dt < 10.0)
             {
                 IMUFactor* imu_factor = new IMUFactor(pre_integrations[1]);
+                // ResidualBlockInfo就是residual的一个wrapper，对外提供evaluate接口，对内调用factor的evaluate接口
                 ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(imu_factor, NULL,
                                                                            vector<double *>{para_Pose[0], para_SpeedBias[0], para_Pose[1], para_SpeedBias[1]},
                                                                            vector<int>{0, 1});
@@ -916,6 +1032,8 @@ void Estimator::optimization()
             }
         }
 
+        // 最老帧对应的视觉约束边
+        // 包括了所有和“以最老帧为深度信息保存帧的所有特征点”存在共视的帧的位姿
         {
             int feature_index = -1;
             for (auto &it_per_id : f_manager.feature)
@@ -927,6 +1045,10 @@ void Estimator::optimization()
                 ++feature_index;
 
                 int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
+
+                // 这就是和上面BA时候的差别
+                // 在这里我们只关注需要被marg的最老帧，
+                // 也就是说我们只关注第一次被看到是在最老帧的特征点
                 if (imu_i != 0)
                     continue;
 
@@ -961,10 +1083,18 @@ void Estimator::optimization()
             }
         }
 
+        // 在这里计算每一个被边缘化边在当前状态量下所对应的残差
         TicToc t_pre_margin;
         marginalization_info->preMarginalize();
         ROS_DEBUG("pre marginalization %f ms", t_pre_margin.toc());
         
+        // 在这里进行Schur消元，计算消元后的残差项，以及对应的雅可比项
+        // 因为紧接着在下次BA中，这里的残差项就要被进行迭代优化了,
+        // 而残差项应该是动态变化的，状态量变了，残差项得跟着变，
+        // 但是那时候部分状态量都被删除了，状态量都不全了，就没法重新计算残差
+        // 因此这里还需要计算残差对状态量的雅可比，以在状态量变化时修正残差。
+        // 注意，这里的初始残差和雅可比都只会计算一次。同时我们会记录初始状态量。
+        // 后续状态量不断迭代更新后，我们只要计算新的状态量和初始状态量的差值，再计算新的残差就好了。
         TicToc t_margin;
         marginalization_info->marginalize();
         ROS_DEBUG("marginalization %f ms", t_margin.toc());
@@ -989,6 +1119,8 @@ void Estimator::optimization()
         last_marginalization_parameter_blocks = parameter_blocks;
         
     }
+
+    // 如果是删除最新帧，就相当于没有插入关键帧，就不进行新的marg了，只是简单的对old_marg做一个传递
     else
     {
         if (last_marginalization_info &&
@@ -1066,6 +1198,7 @@ void Estimator::slideWindow()
     TicToc t_margin;
     if (marginalization_flag == MARGIN_OLD)
     {
+        // 找到SE中需要移除的帧的时间戳
         double t_0 = Headers[0].stamp.toSec();
         back_R0 = Rs[0];
         back_P0 = Ps[0];
@@ -1101,6 +1234,7 @@ void Estimator::slideWindow()
             linear_acceleration_buf[WINDOW_SIZE].clear();
             angular_velocity_buf[WINDOW_SIZE].clear();
 
+            // 删除all_image_frame中到t0为止的所有帧
             if (true || solver_flag == INITIAL)
             {
                 map<double, ImageFrame>::iterator it_0;
@@ -1126,6 +1260,7 @@ void Estimator::slideWindow()
     {
         if (frame_count == WINDOW_SIZE)
         {
+            // 把最后一帧的预积分积到倒数第二帧里面
             for (unsigned int i = 0; i < dt_buf[frame_count].size(); i++)
             {
                 double tmp_dt = dt_buf[frame_count][i];
@@ -1172,6 +1307,15 @@ void Estimator::slideWindowOld()
     bool shift_depth = solver_flag == NON_LINEAR ? true : false;
     if (shift_depth)
     {
+        // feature中仅保存能被SW中的帧看到的特征点
+        // 如果SW被删除后feature点不被看到了，就可以把它删掉了
+
+        // 由于特征点的深度信息都保存为观测到该点的第一帧关键帧坐标系下的深度
+        // 如果某个特征点的第一帧观测帧刚好是需要被删除的那一帧，
+        // 就需要重新计算该点的深度
+        // 方法就是旧帧中的 归一化坐标*深度 ，再加上旧帧外参得到点的世界坐标
+        // 再投影到新帧当中
+
         Matrix3d R0, R1;
         Vector3d P0, P1;
         R0 = back_R0 * ric[0];

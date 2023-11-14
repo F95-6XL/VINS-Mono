@@ -29,7 +29,7 @@ class IntegrationBase
 
     void push_back(double dt, const Eigen::Vector3d &acc, const Eigen::Vector3d &gyr)
     {
-        dt_buf.push_back(dt);
+        dt_buf.push_back(dt); // 保存buffer，用于repropagate
         acc_buf.push_back(acc);
         gyr_buf.push_back(gyr);
         propagate(dt, acc, gyr);
@@ -65,7 +65,13 @@ class IntegrationBase
         // acc_0表示上一时刻线性加速度
         // linearized_ba是bias项
         // delta_q用于表示当前时刻与上一个图像输入时刻位姿的相对关系
-        // 和之前imu_callback中不同的是，这里乘的是delta_q，也就是说这里的计算是在上一幅image输入时小车位姿坐标系下进行的，所以这里也没有减去g
+
+        // 和之前imu_callback中不同的是，这里乘的是delta_q，重点在delta上
+        // 也就是说这里的计算是相对于上一幅image输入时小车位姿来说的，是预积分项
+        // 所以这里也没有减去g，因为g的值是绝对的。
+        // 如果也想相对上一帧image对应小车位姿来说，就需要带入上一帧小车绝对位姿了，预积分的目的就无法达成了
+        // 当然，这里积出来的项是带g的。后续通过上一帧位姿推断下一帧位姿的时候，是要减回去的
+        // 详见oneNote推导
         Vector3d un_acc_0 = delta_q * (_acc_0 - linearized_ba);
         
         // q_t+1 = q_t + d_(q_t)_t * dt
@@ -79,7 +85,7 @@ class IntegrationBase
 
         Vector3d un_acc_1 = result_delta_q * (_acc_1 - linearized_ba); //拿到t+1时刻的角度，就可以求t+1时刻的全局加速度了
         Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1); // 全局加速度的均值，再作为位姿和速度的积分中值
-        result_delta_p = delta_p + delta_v * _dt + 0.5 * un_acc * _dt * _dt;
+        result_delta_p = delta_p + delta_v * _dt + 0.5 * un_acc * _dt * _dt; // 注意这里积分用的也是delta_v，是相对上一帧的速度
         result_delta_v = delta_v + un_acc * _dt;
         result_linearized_ba = linearized_ba;
         result_linearized_bg = linearized_bg;         
@@ -187,6 +193,9 @@ class IntegrationBase
         Eigen::Vector3d dba = Bai - linearized_ba;
         Eigen::Vector3d dbg = Bgi - linearized_bg;
 
+        // 预积分中使用的ba，bg可能存在误差
+        // 这里使用雅可比对预积分值进行修正
+        // 注意这里雅可比矩阵在单次BA中是固定不变的，只能通过repropagate进行更新
         Eigen::Quaterniond corrected_delta_q = delta_q * Utility::deltaQ(dq_dbg * dbg);
         Eigen::Vector3d corrected_delta_v = delta_v + dv_dba * dba + dv_dbg * dbg;
         Eigen::Vector3d corrected_delta_p = delta_p + dp_dba * dba + dp_dbg * dbg;

@@ -216,10 +216,25 @@ VectorXd FeatureManager::getDepthVector()
 
 void FeatureManager::triangulate(Vector3d Ps[], Vector3d tic[], Matrix3d ric[])
 {
+    // 问题：已知相机位姿，以及特征点在相机坐标系中的归一化坐标，求世界点坐标
+    // zp=TP，其中P是世界点坐标，T是相机外参，p是相机坐标系中的归一化坐标，z是深度
+    // 两边同时左乘^p，有^pzp=^pTP，由^pp=0可得^pzp=0，问题转换为^pTP=0方程的求解。
+    // 令^pT=A，问题转换为了Ax=0的方程组，通过SVD分解即可求得。
+    // 注意这里^p是3x3的矩阵，T是3x4的矩阵（舍弃最后的0001），因此A是3x4的矩阵。即
+    //     | 0   -pz   py |        | -pz * T.row(1) + py * T.row(2) |
+    // A = | pz   0   -px | * T =  |  pz * T.row(0) - px * T.row(2) |
+    //     | -py  px   0  |        | -py * T.row(0) + px * T.row(1) |
+    // 其最后一行-py*T.row(0)+px*T.row(1)是前两行的线性叠加，真正能用来解方程的只有前两行。
+    // 因此只有一帧图像是不够的，三角化至少需要两帧。
+    // 当然由于是最小二乘，帧越多，结果越准确
+
+
+    // 遍历从系统启动开始到现在的所有特征点
+    // feature中保存了全局的feature_id所对应的每个点
     for (auto &it_per_id : feature)
     {
-        it_per_id.used_num = it_per_id.feature_per_frame.size();
-        if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
+        it_per_id.used_num = it_per_id.feature_per_frame.size(); // 每个特征点被几帧追踪到
+        if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2)) // 至少有两帧才能三角化
             continue;
 
         if (it_per_id.estimated_depth > 0)
@@ -231,6 +246,9 @@ void FeatureManager::triangulate(Vector3d Ps[], Vector3d tic[], Matrix3d ric[])
         int svd_idx = 0;
 
         Eigen::Matrix<double, 3, 4> P0;
+
+        // Ps，Rs中保存各个帧的相机位姿
+        // 下面把相机位姿转换为IMU位姿
         Eigen::Vector3d t0 = Ps[imu_i] + Rs[imu_i] * tic[0];
         Eigen::Matrix3d R0 = Rs[imu_i] * ric[0];
         P0.leftCols<3>() = Eigen::Matrix3d::Identity();
@@ -242,24 +260,36 @@ void FeatureManager::triangulate(Vector3d Ps[], Vector3d tic[], Matrix3d ric[])
 
             Eigen::Vector3d t1 = Ps[imu_j] + Rs[imu_j] * tic[0];
             Eigen::Matrix3d R1 = Rs[imu_j] * ric[0];
+
+            // imu_j帧的IMU位姿相对于imu_i帧的IMU位姿
+            // 注意！这里因为实际输入方程组的T是相对位姿
+            // 因此解出来的点的世界坐标也是在imu_i这一帧的坐标系下的
             Eigen::Vector3d t = R0.transpose() * (t1 - t0);
             Eigen::Matrix3d R = R0.transpose() * R1;
+            
             Eigen::Matrix<double, 3, 4> P;
             P.leftCols<3>() = R.transpose();
             P.rightCols<1>() = -R.transpose() * t;
+
+            // it_per_frame.point为去畸变后的特征点在各个帧单位平面上的坐标
+            // 即去畸变后的(x/z, y/z, 1)
+            // 归一化，相当于得到特征点的方向向量，但是这一步归一化好像没有必要？？？
             Eigen::Vector3d f = it_per_frame.point.normalized();
             svd_A.row(svd_idx++) = f[0] * P.row(2) - f[2] * P.row(0);
             svd_A.row(svd_idx++) = f[1] * P.row(2) - f[2] * P.row(1);
 
+            // ？？？有的代码确实看不太懂？
             if (imu_i == imu_j)
                 continue;
         }
         ROS_ASSERT(svd_idx == svd_A.rows());
         Eigen::Vector4d svd_V = Eigen::JacobiSVD<Eigen::MatrixXd>(svd_A, Eigen::ComputeThinV).matrixV().rightCols<1>();
-        double svd_method = svd_V[2] / svd_V[3];
+        double svd_method = svd_V[2] / svd_V[3]; 
         //it_per_id->estimated_depth = -b / A;
         //it_per_id->estimated_depth = svd_V[2] / svd_V[3];
 
+        // 获取imu_i帧中的深度信息
+        // 最后点的深度信息统一保存为第一帧观测到他们的帧坐标系下的深度信息
         it_per_id.estimated_depth = svd_method;
         //it_per_id->estimated_depth = INIT_DEPTH;
 

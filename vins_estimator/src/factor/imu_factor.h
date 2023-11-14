@@ -49,6 +49,9 @@ class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
 //delta_v = Qi.inverse() * (g * sum_dt + Vj - Vi);
 //delta_q = Qi.inverse() * Qj;
 
+// 是否在单次BA中使用修正后的ba，bg重新积分
+// 如果重新积分，那pre_integration->evaluate中修正预积分值所用的雅可比矩阵也会更新
+// 但是这里是关掉的
 #if 0
         if ((Bai - pre_integration->linearized_ba).norm() > 0.10 ||
             (Bgi - pre_integration->linearized_bg).norm() > 0.01)
@@ -61,6 +64,7 @@ class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
         residual = pre_integration->evaluate(Pi, Qi, Vi, Bai, Bgi,
                                             Pj, Qj, Vj, Baj, Bgj);
 
+        // 使用协方差做BA的加权
         Eigen::Matrix<double, 15, 15> sqrt_info = Eigen::LLT<Eigen::Matrix<double, 15, 15>>(pre_integration->covariance.inverse()).matrixL().transpose();
         //sqrt_info.setIdentity();
         residual = sqrt_info * residual;
